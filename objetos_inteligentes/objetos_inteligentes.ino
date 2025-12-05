@@ -1,135 +1,168 @@
-#include "MPU6050_tockn.h"
-#include "Wire.h"
+#include <WiFi.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <PubSubClient.h>
 
-MPU6050 mpu6050(Wire);
+// ---------- DADOS DO WI-FI ----------
+const char* ssid = "Rafita";
+const char* password = "25060528";
 
-// Definição dos pinos
-const int botaoPin = 2;     // Botão de emergência no D2
-const int buzzerPin = 15;   // Buzzer no D15
+// ---------- DADOS DO BROKER MQTT ----------
+const char* mqtt_server = "test.mosquitto.org";
+const int mqtt_port = 1883;
+const char* topic_sensor = "alarme/queda";    // envio de alerta
+const char* topic_comando = "alarme/comando"; // comando remoto
 
-// Variáveis para detecção de queda
-float accelThreshold = 2.5; // Limite para detecção de queda (ajustável)
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ---------- MPU ----------
+MPU6050 mpu;
+
+// ---------- PINOS ----------
+const int pinoBotao = 4;
+const int pinoBuzzer = 5;
+
+// ---------- SISTEMA ----------
+bool sistemaAtivo = false;
 bool quedaDetectada = false;
-unsigned long tempoQueda = 0;
-bool sistemaAtivo = true;
+float limiteQueda = 1.4;
 
+// ---------- TEMPO ----------
+unsigned long ultimoEnvio = 0;
+
+// ---------- FUNÇÕES ----------
+void conectarWiFi() {
+  Serial.print("Conectando ao Wi-Fi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Conectado!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  // Recebe comando via MQTT
+  String msg;
+  for (int i = 0; i < length; i++) msg += (char)payload[i];
+
+  Serial.print("Mensagem recebida: ");
+  Serial.println(msg);
+
+  if (String(topic) == topic_comando) {
+    if (msg == "ATIVAR") {
+      sistemaAtivo = true;
+      quedaDetectada = false;
+      digitalWrite(pinoBuzzer, LOW);
+      Serial.println("✅ Sistema ATIVADO via MQTT");
+    } else if (msg == "DESATIVAR") {
+      sistemaAtivo = false;
+      digitalWrite(pinoBuzzer, LOW);
+      Serial.println("⛔ Sistema DESATIVADO via MQTT");
+    } else if (msg == "BUZZER_ON") {
+      digitalWrite(pinoBuzzer, HIGH);
+      Serial.println("🔊 Buzzer LIGADO via MQTT");
+    } else if (msg == "BUZZER_OFF") {
+      digitalWrite(pinoBuzzer, LOW);
+      Serial.println("🔇 Buzzer DESLIGADO via MQTT");
+    }
+  }
+}
+
+void conectarMQTT() {
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+
+  while (!client.connected()) {
+    Serial.print("Conectando ao broker MQTT...");
+    if (client.connect("ESP32Alarme")) {
+      Serial.println("✅ Conectado ao broker!");
+      client.subscribe(topic_comando);
+      client.publish(topic_sensor, "ESP32 Online e pronto!"); // mensagem inicial
+    } else {
+      Serial.print("Falha, rc=");
+      Serial.print(client.state());
+      Serial.println(" tentando novamente em 5s");
+      delay(5000);
+    }
+  }
+}
+
+// ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
   Wire.begin();
-  
-  // Inicializa componentes
-  pinMode(botaoPin, INPUT_PULLUP);
-  pinMode(buzzerPin, OUTPUT);
-  
-  // Sinal de início
-  tone(buzzerPin, 1000, 200);
-  delay(1000);
-  
-  Serial.println();
-  Serial.println("🟢 === SISTEMA DE MONITORAMENTO PARA IDOSOS ===");
-  Serial.println("✅ Sistema inicializado com sucesso!");
-  Serial.println("🎯 Botão de emergência: Pino D2");
-  Serial.println("🔊 Buzzer: Pino D15");
-  Serial.println("📡 Sensor MPU-6050: Inicializando...");
-  Serial.println("=============================================");
-  
-  // Inicializa sensor MPU-6050
-  bool sensorOK = false;
-  for(int i = 0; i < 3; i++) {
-    try {
-      mpu6050.begin();
-      mpu6050.calcGyroOffsets(true);
-      sensorOK = true;
-      break;
-    } catch (...) {
-      Serial.println("⚠️ Tentativa " + String(i+1) + " - Sensor não respondendo...");
-      delay(1000);
-    }
-  }
-  
-  if(sensorOK) {
-    Serial.println("✅ Sensor MPU-6050 calibrado e pronto!");
-  } else {
-    Serial.println("❌ ERRO: Sensor MPU-6050 não detectado!");
-    Serial.println("🔧 Verifique conexões: VCC, GND, SDA(21), SCL(22)");
-    sistemaAtivo = false;
-  }
-  
-  Serial.println("📊 Iniciando monitoramento...");
-  Serial.println();
+
+  pinMode(pinoBotao, INPUT_PULLUP);
+  pinMode(pinoBuzzer, OUTPUT);
+  digitalWrite(pinoBuzzer, LOW);
+
+  mpu.initialize();
+
+  conectarWiFi();
+  conectarMQTT();
+
+  Serial.println("=== SISTEMA DE ALARME DE QUEDA ===");
+  Serial.println("Aperte o botão para ATIVAR/DESATIVAR");
+  Serial.println("=================================");
 }
 
+// ---------- LOOP ----------
 void loop() {
-  // Controle do botão de emergência com anti-ressalto
-  static unsigned long ultimoBotao = 0;
-  int estadoBotao = digitalRead(botaoPin);
-  
-  if(estadoBotao == LOW && (millis() - ultimoBotao > 1000)) {
-    ultimoBotao = millis();
-    Serial.println("🚨🚨🚨 BOTÃO DE EMERGÊNCIA PRESSIONADO! 🚨🚨🚨");
-    ativarAlerta(3, 1000); // 3 bips longos
-    delay(2000); // Evita múltiplas ativações
+  if (!client.connected()) {
+    conectarMQTT();
   }
-  
-  // Monitoramento do sensor MPU-6050 (se estiver ativo)
-  if(sistemaAtivo) {
-    mpu6050.update();
-    
-    float accelX = mpu6050.getAccX();
-    float accelY = mpu6050.getAccY(); 
-    float accelZ = mpu6050.getAccZ();
-    
-    float accelTotal = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);
-    
-    // Detecção de queda
-    if(accelTotal > accelThreshold && !quedaDetectada) {
+  client.loop();
+
+  // ---------- BOTÃO FÍSICO ----------
+  static bool ultimoEstado = HIGH;
+  bool estadoAtual = digitalRead(pinoBotao);
+
+  if (ultimoEstado == HIGH && estadoAtual == LOW) {
+    sistemaAtivo = !sistemaAtivo;
+    quedaDetectada = false;
+    digitalWrite(pinoBuzzer, LOW);
+
+    if (sistemaAtivo) {
+      Serial.println("✅ Sistema ATIVADO pelo botão");
+      client.publish(topic_sensor, "Sistema ATIVADO pelo botão");
+    } else {
+      Serial.println("⛔ Sistema DESATIVADO pelo botão");
+      client.publish(topic_sensor, "Sistema DESATIVADO pelo botão");
+    }
+    delay(400); // debounce
+  }
+  ultimoEstado = estadoAtual;
+
+  // ---------- DETECÇÃO DE QUEDA ----------
+  if (sistemaAtivo) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+
+    float x = ax / 16384.0;
+    float y = ay / 16384.0;
+    float z = az / 16384.0;
+
+    float forca = sqrt(x * x + y * y + z * z);
+    Serial.print("Força: ");
+    Serial.println(forca);
+
+    if (forca > limiteQueda && !quedaDetectada) {
       quedaDetectada = true;
-      tempoQueda = millis();
-      
-      Serial.println();
-      Serial.println("⚠️⚠️⚠️ QUEDA DETECTADA! ⚠️⚠️⚠️");
-      Serial.print("📊 Aceleração: "); Serial.println(accelTotal);
-      Serial.print("📍 X:"); Serial.print(accelX);
-      Serial.print(" Y:"); Serial.print(accelY); 
-      Serial.print(" Z:"); Serial.println(accelZ);
-      
-      ativarAlerta(5, 500); // 5 bips rápidos
-    }
-    
-    // Reset da detecção após 10 segundos
-    if(quedaDetectada && (millis() - tempoQueda > 10000)) {
-      quedaDetectada = false;
-      Serial.println("✅ Sistema resetado - pronto para nova detecção");
-    }
-    
-    // Mostra status a cada 5 segundos
-    static unsigned long ultimoStatus = 0;
-    if(millis() - ultimoStatus > 5000) {
-      ultimoStatus = millis();
-      Serial.print("📡 Sistema OK | ");
-      Serial.print("Queda: "); Serial.print(quedaDetectada ? "SIM" : "não");
-      Serial.print(" | Botão: "); Serial.print(estadoBotao ? "SOLTO" : "PRESSIONADO");
-      Serial.print(" | Tempo: "); Serial.print(millis() / 1000); Serial.println("s");
-    }
-  } else {
-    // Modo de emergência - só botão funciona
-    static unsigned long ultimoErro = 0;
-    if(millis() - ultimoErro > 10000) {
-      ultimoErro = millis();
-      Serial.println("🔴 MODO EMERGÊNCIA - Apenas botão funciona");
-      Serial.println("🔧 Verifique conexão do sensor MPU-6050");
+      digitalWrite(pinoBuzzer, HIGH);
+
+      unsigned long agora = millis();
+      if (agora - ultimoEnvio > 5000) {
+        client.publish(topic_sensor, "🚨 ALERTA! QUEDA DETECTADA!");
+        Serial.println("📨 Mensagem enviada via MQTT!");
+        ultimoEnvio = agora;
+      }
     }
   }
-  
-  delay(100); // Pequeno delay para estabilidade
+
+  delay(200);
 }
 
-// Função para ativar alertas sonoros
-void ativarAlerta(int vezes, int duracao) {
-  for(int i = 0; i < vezes; i++) {
-    digitalWrite(buzzerPin, HIGH);
-    delay(duracao);
-    digitalWrite(buzzerPin, LOW);
-    if(i < vezes - 1) delay(200);
-  }
-}
